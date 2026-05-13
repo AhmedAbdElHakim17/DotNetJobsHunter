@@ -9,7 +9,7 @@ pinned: false
 
 <div align="center">
   <h1> Multi-Board Job to Telegram Bot</h1>
-  <p>An automated, zero-dependency async scraper that extracts job matches from 6+ major job boards (including MENA & Remote platforms) and delivers them straight to your Telegram channel.</p>
+  <p>An automated, zero-dependency async scraper that extracts job matches from 5 major job boards (including MENA & Remote platforms) and delivers them straight to your Telegram channel.</p>
 </div>
 
 <hr />
@@ -23,10 +23,9 @@ This bot utilizes ultra-fast concurrent `httpx` requests to fetch the latest job
 
 1. **LinkedIn** (Guest API)
 2. **Wuzzuf** (Egypt Focus)
-3. **Bayt** (MENA: Egypt, KSA, UAE)
-4. **GulfTalent** (Gulf: KSA, UAE)
-5. **Remotive** (Remote Global)
-6. **Himalayas** (Remote Global)
+3. **GulfTalent** (Gulf: KSA, UAE)
+4. **Remotive** (Remote Global)
+5. **Himalayas** (Remote Global)
 
 ### Key Features
 

@@ -1,6 +1,7 @@
 import asyncio
 import sys
 import os
+import random
 from aiohttp import web
 from loguru import logger
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -11,7 +12,6 @@ from scraper.linkedin import scrape_linkedin_jobs
 from scraper.remotive import scrape_remotive_jobs
 from scraper.himalayas import scrape_himalayas_jobs
 from scraper.wuzzuf import scrape_wuzzuf_jobs
-from scraper.bayt import scrape_bayt_jobs
 from scraper.gulftalent import scrape_gulftalent_jobs
 from telegram_bot.notifier import TelegramNotifier
 
@@ -19,73 +19,93 @@ from telegram_bot.notifier import TelegramNotifier
 logger.remove()
 logger.add(sys.stdout, level=LOG_LEVEL, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>")
 
-# Concurrency control — prevents slamming APIs and hitting Railway log limits
-MAX_CONCURRENT = 10
+async def run_scraper_batch(tasks, semaphore, delay=0.5):
+    """Run a batch of scraper coroutines with bounded concurrency and delay."""
+    results = []
+    
+    async def bounded(coro):
+        async with semaphore:
+            result = await coro
+            await asyncio.sleep(delay)
+            return result
+    
+    wrapped = [bounded(t) for t in tasks]
+    raw = await asyncio.gather(*wrapped, return_exceptions=True)
+    
+    for res in raw:
+        if isinstance(res, list):
+            results.extend(res)
+        elif isinstance(res, Exception):
+            logger.error(f"A scraper failed: {res}")
+    
+    return results
 
 async def scrape_and_notify(repo: JobRepository, notifier: TelegramNotifier):
     """Main pipeline execution for a single scrape cycle."""
     logger.info(f"Starting scrape cycle — {len(LINKEDIN_KEYWORDS)} keywords × {len(LINKEDIN_LOCATIONS)} locations")
     
-    scraped_jobs = []
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    all_jobs = []
     
-    async def rate_limited(coro):
-        """Wrap a scraper coroutine with a semaphore for rate limiting."""
-        async with semaphore:
-            result = await coro
-            await asyncio.sleep(0.3)  # Small delay between completions
-            return result
-    
-    tasks = []
-    
-    # ── Location-AWARE scrapers (need to run per keyword × location) ──
+    # ── Phase 1: LinkedIn (most rate-limited — low concurrency + longer delay) ──
+    linkedin_tasks = []
     for loc in LINKEDIN_LOCATIONS:
         for key in LINKEDIN_KEYWORDS:
-            tasks.append(rate_limited(scrape_linkedin_jobs(keyword=key, location=loc, max_pages=1)))
-            tasks.append(rate_limited(scrape_wuzzuf_jobs(keyword=key, location=loc, max_results=10)))
-            tasks.append(rate_limited(scrape_bayt_jobs(keyword=key, location=loc, max_results=10)))
-            tasks.append(rate_limited(scrape_gulftalent_jobs(keyword=key, location=loc, max_results=10)))
+            linkedin_tasks.append(scrape_linkedin_jobs(keyword=key, location=loc, max_pages=1))
     
-    # ── Location-AGNOSTIC scrapers (only run once per keyword) ──
+    logger.info(f"Phase 1: LinkedIn — {len(linkedin_tasks)} tasks (3 concurrent, 2s delay)...")
+    linkedin_sem = asyncio.Semaphore(3)
+    jobs = await run_scraper_batch(linkedin_tasks, linkedin_sem, delay=random.uniform(1.5, 2.5))
+    all_jobs.extend(jobs)
+    logger.info(f"LinkedIn done — {len(jobs)} jobs collected.")
+    
+    # ── Phase 2: Location-aware scrapers (Wuzzuf, GulfTalent) ──
+    regional_tasks = []
+    for loc in LINKEDIN_LOCATIONS:
+        for key in LINKEDIN_KEYWORDS:
+            regional_tasks.append(scrape_wuzzuf_jobs(keyword=key, location=loc, max_results=10))
+            regional_tasks.append(scrape_gulftalent_jobs(keyword=key, location=loc, max_results=10))
+    
+    logger.info(f"Phase 2: Regional scrapers — {len(regional_tasks)} tasks (10 concurrent)...")
+    regional_sem = asyncio.Semaphore(10)
+    jobs = await run_scraper_batch(regional_tasks, regional_sem, delay=0.3)
+    all_jobs.extend(jobs)
+    logger.info(f"Regional done — {len(jobs)} jobs collected.")
+    
+    # ── Phase 3: Location-agnostic scrapers (Remotive, Himalayas — once per keyword) ──
+    remote_tasks = []
     for key in LINKEDIN_KEYWORDS:
-        tasks.append(rate_limited(scrape_remotive_jobs(keyword=key, location="Remote", max_results=10)))
-        tasks.append(rate_limited(scrape_himalayas_jobs(keyword=key, location="Remote", max_results=10)))
-
-    logger.info(f"Dispatching {len(tasks)} scraper tasks (max {MAX_CONCURRENT} concurrent)...")
+        remote_tasks.append(scrape_remotive_jobs(keyword=key, location="Remote", max_results=10))
+        remote_tasks.append(scrape_himalayas_jobs(keyword=key, location="Remote", max_results=10))
     
-    # Run them concurrently (bounded by semaphore)
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    logger.info(f"Phase 3: Remote scrapers — {len(remote_tasks)} tasks (10 concurrent)...")
+    remote_sem = asyncio.Semaphore(10)
+    jobs = await run_scraper_batch(remote_tasks, remote_sem, delay=0.3)
+    all_jobs.extend(jobs)
+    logger.info(f"Remote done — {len(jobs)} jobs collected.")
     
-    error_count = 0
-    for res in results:
-        if isinstance(res, list):
-            scraped_jobs.extend(res)
-        elif isinstance(res, Exception):
-            error_count += 1
-            logger.error(f"A scraper failed with exception: {res}")
+    # ── Summary ──
+    logger.info(f"Scraping complete. {len(all_jobs)} total raw jobs collected.")
     
-    logger.info(f"Scraping done. {len(scraped_jobs)} raw jobs collected, {error_count} errors.")
-    
-    if not scraped_jobs:
+    if not all_jobs:
         logger.info("No jobs found this cycle across any source.")
         return
 
-    # 2. Store & Dedupe
+    # Store & Dedupe
     new_jobs_count = 0
-    for job in scraped_jobs:
+    for job in all_jobs:
         if repo.insert_job(job):
             new_jobs_count += 1
             
     logger.info(f"Deduplication complete. {new_jobs_count} brand new jobs added to database.")
 
-    # 3. Retrieve Pending & Notify
+    # Retrieve Pending & Notify
     unsent_jobs = repo.get_unsent_jobs()
     if unsent_jobs:
         await notifier.send_job_alerts(unsent_jobs, repo)
     else:
         logger.info("No unsent jobs pending for Telegram.")
         
-    # 4. Cleanup old rows
+    # Cleanup old rows
     repo.cleanup_old_jobs(days=14)
 
 async def main():
@@ -120,7 +140,6 @@ async def main():
     # -----------------------------------------------
 
     try:
-        # Keep the main thread alive for asyncio scheduler and web server
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
