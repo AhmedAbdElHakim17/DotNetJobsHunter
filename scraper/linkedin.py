@@ -73,7 +73,7 @@ def is_title_relevant(title: str) -> bool:
             return True
             
     # Also explicitly accept general software terms just to be safe
-    general_terms = [ "developer", "programmer", "software", "backend", "frontend", "full stack", "tech lead", "architect", "qa", "tester"]
+    general_terms = [ "developer", "software", "backend", "full stack", "C#", ".net"]
     for t in general_terms:
         if t in title_lower:
             return True
